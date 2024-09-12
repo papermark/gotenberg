@@ -37,6 +37,7 @@ type Api struct {
 	basicAuthUsername         string
 	basicAuthPassword         string
 	disableHealthCheckLogging bool
+	bearerToken               string
 
 	routes              []Route
 	externalMiddlewares []Middleware
@@ -169,6 +170,7 @@ func (a *Api) Descriptor() gotenberg.ModuleDescriptor {
 			fs.String("api-trace-header", "Gotenberg-Trace", "Set the header name to use for identifying requests")
 			fs.Bool("api-enable-basic-auth", false, "Enable basic authentication - will look for the GOTENBERG_API_BASIC_AUTH_USERNAME and GOTENBERG_API_BASIC_AUTH_PASSWORD environment variables")
 			fs.Bool("api-disable-health-check-logging", false, "Disable health check logging")
+			fs.Bool("api-enable-bearer-token-auth", false, "Enable bearer token authentication")
 			return fs
 		}(),
 		New: func() gotenberg.Module { return new(Api) },
@@ -210,6 +212,15 @@ func (a *Api) Provision(ctx *gotenberg.Context) error {
 		}
 		a.basicAuthUsername = basicAuthUsername
 		a.basicAuthPassword = basicAuthPassword
+	}
+
+	enableBearerToken := flags.MustBool("api-enable-bearer-token-auth")
+	if enableBearerToken {
+		bearerToken, err := gotenberg.StringEnv("GOTENBERG_API_BEARER_TOKEN")
+		if err != nil {
+			return fmt.Errorf("get bearer token from env: %w", err)
+		}
+		a.bearerToken = bearerToken
 	}
 
 	// Get routes from modules.
@@ -409,6 +420,7 @@ func (a *Api) Start() error {
 		rootPathMiddleware(a.rootPath),
 		traceMiddleware(a.traceHeader),
 		loggerMiddleware(a.logger, disableLoggingForPaths),
+		a.bearerTokenMiddleware(),
 	)
 
 	// Add the modules' middlewares in their respective stacks.
@@ -522,6 +534,34 @@ func (a *Api) StartupMessage() string {
 // Stop stops the HTTP server.
 func (a *Api) Stop(ctx context.Context) error {
 	return a.srv.Shutdown(ctx)
+}
+
+func (a *Api) bearerTokenMiddleware() echo.MiddlewareFunc {
+	return func(next echo.HandlerFunc) echo.HandlerFunc {
+		return func(c echo.Context) error {
+			// Skip authentication for health and version endpoints
+			if strings.HasSuffix(c.Path(), "/health") || strings.HasSuffix(c.Path(), "/version") {
+				return next(c)
+			}
+
+			authHeader := c.Request().Header.Get("Authorization")
+			if authHeader == "" {
+				return echo.NewHTTPError(http.StatusUnauthorized, "Missing Authorization header")
+			}
+
+			tokenParts := strings.Split(authHeader, " ")
+			if len(tokenParts) != 2 || strings.ToLower(tokenParts[0]) != "bearer" {
+				return echo.NewHTTPError(http.StatusUnauthorized, "Invalid Authorization header format")
+			}
+
+			token := tokenParts[1]
+			if token != a.bearerToken {
+				return echo.NewHTTPError(http.StatusUnauthorized, "Invalid API token")
+			}
+
+			return next(c)
+		}
+	}
 }
 
 // Interface guards.
